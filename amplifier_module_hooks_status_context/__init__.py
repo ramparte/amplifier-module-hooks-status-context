@@ -6,6 +6,7 @@ Injects current git status and datetime into agent context before each prompt.
 # Amplifier module metadata
 __amplifier_module_type__ = "hook"
 
+import hashlib
 import logging
 import platform
 import subprocess
@@ -92,6 +93,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - datetime_include_timezone: Include timezone name (default: False)
             - include_session: Enable session ID injection (default: True)
             - priority: Hook priority (default: 0)
+            - coalesce: Per-turn delta-emission (default: True). When True, the
+              status block is injected on the first provider:request of each
+              turn and thereafter only when its content changed. When False,
+              inject on every provider:request (legacy behavior).
 
     Returns:
         Optional cleanup function
@@ -174,6 +179,10 @@ class StatusContextHook:
         # Hook priority
         self.priority = config.get("priority", 0)
 
+        # Per-turn delta-emission (coalescing)
+        self.coalesce = bool(config.get("coalesce", True))
+        self._last_injected_hash: str | None = None
+
     def register(self, hooks):
         """Register this hook for provider:request events (fires right before LLM call)."""
         hooks.register(
@@ -181,6 +190,12 @@ class StatusContextHook:
             self.on_provider_request,
             priority=self.priority,
             name="hooks-status-context",
+        )
+        hooks.register(
+            "prompt:submit",
+            self.on_prompt_submit,
+            priority=self.priority,
+            name="hooks-status-context-turn-reset",
         )
 
     async def on_provider_request(self, event: str, data: dict[str, Any]) -> HookResult:
@@ -211,6 +226,17 @@ class StatusContextHook:
         behavioral_note = "\n\nThis context is for your reference only. DO NOT mention this status information to the user unless directly relevant to their question. Process silently and continue your work."
         context_injection = f'<system-reminder source="hooks-status-context">\n{context_content}{behavioral_note}\n</system-reminder>'
 
+        # Coalescing (per-turn delta-emission): only inject on the first call of a
+        # turn or when the block content changed since the last injection.
+        if self.coalesce and "iteration" in data:
+            block_hash = hashlib.sha256(context_injection.encode()).hexdigest()
+            new_turn = (data.get("iteration") == 0) or (
+                self._last_injected_hash is None
+            )
+            if not new_turn and block_hash == self._last_injected_hash:
+                return HookResult(action="continue")
+            self._last_injected_hash = block_hash
+
         return HookResult(
             action="inject_context",
             context_injection=context_injection,
@@ -218,6 +244,11 @@ class StatusContextHook:
             ephemeral=True,  # Temporary injection, not stored in context
             suppress_output=True,  # Don't show verbose status to user
         )
+
+    async def on_prompt_submit(self, event: str, data: dict[str, Any]) -> HookResult:
+        """Reset coalescing state at the start of each turn."""
+        self._last_injected_hash = None
+        return HookResult(action="continue")
 
     def _gather_env_info(self) -> dict[str, Any]:
         """Gather environment information (working dir, platform, OS, date, session, git detection)."""
