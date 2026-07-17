@@ -6,7 +6,6 @@ Injects current git status and datetime into agent context before each prompt.
 # Amplifier module metadata
 __amplifier_module_type__ = "hook"
 
-import hashlib
 import logging
 import platform
 import subprocess
@@ -93,10 +92,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - datetime_include_timezone: Include timezone name (default: False)
             - include_session: Enable session ID injection (default: True)
             - priority: Hook priority (default: 0)
-            - coalesce: Per-turn delta-emission (default: True). When True, the
-              status block is injected on the first provider:request of each
-              turn and thereafter only when its content changed. When False,
-              inject on every provider:request (legacy behavior).
+            - coalesce: Once-per-turn snapshot injection (default: True). When
+              True, the status block is computed and injected on the first
+              provider:request of each turn; the content is a turn-start
+              snapshot and is never re-injected mid-turn (skipped calls build
+              no content and run no git subprocesses). When False, inject on
+              every provider:request (legacy behavior).
 
     Returns:
         Optional cleanup function
@@ -179,9 +180,9 @@ class StatusContextHook:
         # Hook priority
         self.priority = config.get("priority", 0)
 
-        # Per-turn delta-emission (coalescing)
+        # Once-per-turn snapshot gating (coalescing)
         self.coalesce = bool(config.get("coalesce", True))
-        self._last_injected_hash: str | None = None
+        self._injected_this_turn: bool = False
 
     def register(self, hooks):
         """Register this hook for provider:request events (fires right before LLM call)."""
@@ -209,6 +210,16 @@ class StatusContextHook:
         Returns:
             HookResult with context injection
         """
+        # Once-per-turn snapshot gate: if we already injected this turn, skip
+        # BEFORE building any content (no _gather_env_info, no git subprocesses).
+        # iteration <= 1 is turn start (covers live 1-based loop-streaming AND
+        # 0-based orchestrators); missing 'iteration' key or coalesce=False
+        # falls back to legacy inject-every-call behavior.
+        if self.coalesce and "iteration" in data:
+            it = data.get("iteration") or 0
+            if it > 1 and self._injected_this_turn:
+                return HookResult(action="continue")
+
         # Gather environment info (always shown)
         env_info = self._gather_env_info()
 
@@ -226,16 +237,9 @@ class StatusContextHook:
         behavioral_note = "\n\nThis context is for your reference only. DO NOT mention this status information to the user unless directly relevant to their question. Process silently and continue your work."
         context_injection = f'<system-reminder source="hooks-status-context">\n{context_content}{behavioral_note}\n</system-reminder>'
 
-        # Coalescing (per-turn delta-emission): only inject on the first call of a
-        # turn or when the block content changed since the last injection.
+        # Mark the snapshot as injected for this turn (coalesce path only).
         if self.coalesce and "iteration" in data:
-            block_hash = hashlib.sha256(context_injection.encode()).hexdigest()
-            new_turn = (data.get("iteration") == 0) or (
-                self._last_injected_hash is None
-            )
-            if not new_turn and block_hash == self._last_injected_hash:
-                return HookResult(action="continue")
-            self._last_injected_hash = block_hash
+            self._injected_this_turn = True
 
         return HookResult(
             action="inject_context",
@@ -247,7 +251,7 @@ class StatusContextHook:
 
     async def on_prompt_submit(self, event: str, data: dict[str, Any]) -> HookResult:
         """Reset coalescing state at the start of each turn."""
-        self._last_injected_hash = None
+        self._injected_this_turn = False
         return HookResult(action="continue")
 
     def _gather_env_info(self) -> dict[str, Any]:
